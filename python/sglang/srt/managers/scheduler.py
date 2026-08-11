@@ -2280,26 +2280,27 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
-                last_hash = last_host_node.get_last_hash_value()
-                matched_len = len(req.prefix_indices) + req.host_hit_length
-                match_end = req._compute_max_prefix_len(
-                    len(req.full_untruncated_fill_ids)
-                )
-                new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+            # L3 is a best-effort lookup for every eligible prefill. The local
+            # radix result selects the hash anchor, but no longer gates whether
+            # storage is queried. The storage layer still enforces its own
+            # minimum lookup length and rate limit.
+            last_hash = last_host_node.get_last_hash_value()
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
+            new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
 
-                prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
-                    else None
-                )
-                self.tree_cache.prefetch_from_storage(
-                    req.rid,
-                    last_host_node,
-                    new_input_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
+            prefix_keys = (
+                last_host_node.get_prefix_hash_values(last_host_node.parent)
+                if self.tree_cache.hicache_storage_pass_prefix_keys
+                else None
+            )
+            self.tree_cache.prefetch_from_storage(
+                req.rid,
+                last_host_node,
+                new_input_tokens,
+                last_hash,
+                prefix_keys,
+            )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2883,8 +2884,8 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
+                req.record_storage_hit_tokens(
+                    self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 )
 
             req.init_next_round_input(self.tree_cache)

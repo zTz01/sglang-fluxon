@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import sys
 import threading
@@ -101,6 +102,13 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        self.storage_backup_pending_id: Optional[int] = None
+        # True only after every page in this node has completed the storage
+        # backup. It deliberately does not imply that HostKV is still resident.
+        self.storage_backed = False
+        # Accounting is explicit because a split turns one accounted node into
+        # two nodes without changing total token coverage.
+        self.storage_metadata_accounted = False
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -116,6 +124,17 @@ class UnifiedTreeNode:
         return (
             self.parent is not None
             and self.component_data[ComponentType.FULL].value is None
+        )
+
+    @property
+    def storage_only(self) -> bool:
+        """Full KV has no L1/L2 payload but is known complete in storage."""
+        full = self.component_data[ComponentType.FULL]
+        return (
+            self.parent is not None
+            and full.value is None
+            and full.host_value is None
+            and self.storage_backed
         )
 
     def __lt__(self, other: UnifiedTreeNode):
@@ -302,6 +321,14 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+class _OngoingStorageBackup(NamedTuple):
+    """Tracks one host→storage operation across any in-flight node splits."""
+
+    lock_node: UnifiedTreeNode
+    lock_params: DecLockRefParams
+    publish_nodes: list[UnifiedTreeNode]
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -373,6 +400,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        self.storage_metadata_capacity = 0
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -459,6 +487,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
+        self.evictable_storage_leaves: set[UnifiedTreeNode] = set()
+        self.storage_metadata_size_ = 0
         self.host_lru_lists = {
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
@@ -468,7 +498,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
-        self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.ongoing_backup: dict[int, _OngoingStorageBackup] = {}
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -537,6 +567,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         # State initialization
+        self.storage_metadata_capacity = server_args.hicache_storage_metadata_capacity
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
@@ -576,6 +607,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            storage_metadata_hit_length,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
             params,
@@ -583,6 +615,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            storage_metadata_hit_length,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -884,7 +917,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
@@ -895,6 +928,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
+        storage_metadata_hit_length = 0
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
             validators = tuple(
@@ -932,13 +966,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
 
-            # HiCache: dead node (evicted + not backuped) — stop traversal
-            if child.evicted and not child.backuped:
+            # A storage-only node has no L1/L2 payload, but its exact radix
+            # path remains useful for accounting and in-place restoration.
+            # L3 lookup itself is unconditional; truly dead nodes still
+            # terminate local traversal.
+            if child.evicted and not child.backuped and not child.storage_only:
                 break
 
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 node = self._split_node(child.key, child, prefix_len)
+                if node.storage_only:
+                    storage_metadata_hit_length += prefix_len
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 _update_best_if_valid(node)
@@ -947,6 +986,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if not child.evicted:
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
+            if node.storage_only:
+                storage_metadata_hit_length += prefix_len
             _update_best_if_valid(node)
             key = key[prefix_len:]
             if len(key):
@@ -957,6 +998,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            storage_metadata_hit_length,
         )
 
     def _match_post_processor(
@@ -966,6 +1008,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
+        storage_metadata_hit_length: int,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self._components_tuple:
@@ -999,6 +1042,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
+            storage_metadata_hit_length=storage_metadata_hit_length,
         )
 
         for component in self._components_tuple:
@@ -1014,6 +1058,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
     ) -> UnifiedTreeNode:
         new_node = UnifiedTreeNode(self.tree_components, priority=child.priority)
+        new_node.storage_backed = child.storage_backed
+        new_node.storage_backup_pending_id = child.storage_backup_pending_id
+        # If the child was already counted as storage-only, splitting its key
+        # merely partitions the same token coverage between parent and child.
+        # Both flags become true while the aggregate counter stays unchanged.
+        new_node.storage_metadata_accounted = child.storage_metadata_accounted
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
@@ -1034,6 +1084,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
+        if child.storage_backup_pending_id is not None:
+            self._replace_pending_storage_backup_node(child, [new_node, child])
 
         self._for_each_component_lru(
             new_node, UnifiedLRUList.insert_mru, skip_existing=True
@@ -1084,6 +1136,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ct = BASE_COMPONENT_TYPE
         cd = node.component_data[ct]
         assert cd.value is None
+        self._leave_storage_only(node)
         n = len(fresh_value)
         cd.value = fresh_value.clone()
         self.component_evictable_size_[ct] += n
@@ -1215,24 +1268,50 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return InsertResult(prefix_len=0, mamba_exist=True)
 
         child_key = key.child_key(self.page_size)
-        matched_length = 0
+        reused_host_parts: list[torch.Tensor] = []
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
 
+            incoming_host_value = host_value[:prefix_len]
+            if prefix_len < len(node.key):
+                node = self._split_node(node.key, node, prefix_len)
+
+            full = node.component_data[BASE_COMPONENT_TYPE]
+            if full.host_value is None:
+                # The fetched slots now become the HostKV payload of an
+                # existing storage-only (or device-only) radix fragment.
+                self._leave_storage_only(node)
+                full.host_value = incoming_host_value.clone()
+                node.storage_backed = True
+                self._update_evictable_leaf_sets(node)
+                if node.parent is not None:
+                    self._update_evictable_leaf_sets(node.parent)
+            else:
+                reused_host_parts.append(incoming_host_value)
+                # A successful storage read also proves this immutable radix
+                # fragment exists in L3, even if HostKV won a concurrent race.
+                node.storage_backed = True
+
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
-            matched_length += prefix_len
-
-            if prefix_len < len(node.key):
-                node = self._split_node(node.key, node, prefix_len)
 
             if len(key):
                 child_key = key.child_key(self.page_size)
 
-        result = InsertResult(prefix_len=matched_length, total_len=total_len)
+        reused_host_indices = (
+            torch.cat(reused_host_parts) if reused_host_parts else None
+        )
+        reused_host_tokens = (
+            len(reused_host_indices) if reused_host_indices is not None else 0
+        )
+        result = InsertResult(
+            prefix_len=reused_host_tokens,
+            total_len=total_len,
+            reused_host_indices=reused_host_indices,
+        )
         if len(key) == 0:
             if (
                 node is not self.root_node
@@ -1246,6 +1325,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = key
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
+        new_node.storage_backed = True
         node.children[child_key] = new_node
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
@@ -1311,6 +1391,58 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node
 
+    def _enter_storage_only(self, node: UnifiedTreeNode) -> None:
+        assert node.storage_only
+        assert not node.storage_metadata_accounted
+        node.storage_metadata_accounted = True
+        self.storage_metadata_size_ += len(node.key)
+
+    def _leave_storage_only(self, node: UnifiedTreeNode) -> None:
+        if not node.storage_metadata_accounted:
+            return
+        self.storage_metadata_size_ -= len(node.key)
+        assert self.storage_metadata_size_ >= 0
+        node.storage_metadata_accounted = False
+        self.evictable_storage_leaves.discard(node)
+
+    def _delete_storage_metadata_leaf(
+        self,
+        node: UnifiedTreeNode,
+        tracker: Optional[dict[ComponentType, int]] = None,
+    ) -> UnifiedTreeNode:
+        """Delete one payload-free storage metadata leaf from the radix tree."""
+        assert self._is_storage_leaf(node), f"node {node.id} is not an S-leaf"
+        parent = node.parent
+        self._leave_storage_only(node)
+        node.storage_backed = False
+        node.storage_backup_pending_id = None
+        self._remove_leaf_from_parent(node)
+        self._update_evictable_leaf_sets(parent)
+        if tracker is None:
+            tracker = {ct: 0 for ct in self.tree_components}
+        self._iteratively_delete_tombstone_leaf(node, tracker)
+        return parent
+
+    def _enforce_storage_metadata_capacity(self) -> None:
+        """Trim storage-only radix metadata independently of HostKV payload."""
+        if self.storage_metadata_size_ <= self.storage_metadata_capacity:
+            return
+        heap = [
+            (self.eviction_strategy.get_priority(n), n)
+            for n in self.evictable_storage_leaves
+        ]
+        heapq.heapify(heap)
+        while self.storage_metadata_size_ > self.storage_metadata_capacity and heap:
+            _, node = heapq.heappop(heap)
+            if node not in self.evictable_storage_leaves:
+                continue
+            parent = self._delete_storage_metadata_leaf(node)
+            if parent in self.evictable_storage_leaves:
+                heapq.heappush(
+                    heap,
+                    (self.eviction_strategy.get_priority(parent), parent),
+                )
+
     def _evict_component_and_detach_lru(
         self,
         node: UnifiedTreeNode,
@@ -1357,6 +1489,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             has_device = cur.component_data[ct].value is not None
             has_host = cur.component_data[ct].host_value is not None
+            has_storage_metadata = cur.storage_metadata_accounted
 
             if has_device:
                 self._update_evictable_leaf_sets(cur)
@@ -1373,6 +1506,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._update_evictable_leaf_sets(cur)
                 break
 
+            if has_storage_metadata:
+                self._update_evictable_leaf_sets(cur)
+                break
+
             # Full absent on both layers — evict remaining host data, delete.
             for comp in self.components.values():
                 if comp.node_has_component_data(cur, target=EvictLayer.HOST):
@@ -1381,6 +1518,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
 
             self.evictable_host_leaves.discard(cur)
+            self.evictable_storage_leaves.discard(cur)
+            cur.storage_backed = False
             self._remove_leaf_from_parent(cur)
             parent = cur.parent
             self._update_evictable_leaf_sets(parent)
@@ -1435,19 +1574,37 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return True
 
     def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
-        """H-leaf: evicted, Full host value present, no children, unlocked, not root.
+        """H-leaf: evicted, Full host value present and no lower HostKV child.
 
         Only the Full (base) component host_value is required; auxiliary
-        components are not mandatory for H-leaf membership."""
+        components are not mandatory for H-leaf membership. With metadata
+        retention enabled, a fully storage-backed node may be evicted above
+        storage-only children; otherwise legacy leaf-only deletion applies."""
         if node is self.root_node or not node.evicted:
             return False
         if not node.backuped:
             return False
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return False
-        if len(node.children) > 0:
-            return False
+        if node.children:
+            if self.storage_metadata_capacity <= 0 or not node.storage_backed:
+                return False
+            if any(
+                child.component_data[BASE_COMPONENT_TYPE].host_value is not None
+                for child in node.children.values()
+            ):
+                return False
         return True
+
+    def _is_storage_leaf(self, node: UnifiedTreeNode) -> bool:
+        """S-leaf: accounted storage-only metadata with no children or locks."""
+        if node is self.root_node or not node.storage_metadata_accounted:
+            return False
+        if not node.storage_only or len(node.children) > 0:
+            return False
+        if any(cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data):
+            return False
+        return node.storage_backup_pending_id is None
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -1460,6 +1617,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.evictable_host_leaves.add(node)
         else:
             self.evictable_host_leaves.discard(node)
+
+        if self._is_storage_leaf(node):
+            self.evictable_storage_leaves.add(node)
+        else:
+            self.evictable_storage_leaves.discard(node)
 
     def _evict_to_host(
         self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None
@@ -1520,18 +1682,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
     ) -> None:
-        """Atomically evict all components on a host leaf.
+        """Release HostKV and optionally retain its storage-only radix metadata.
 
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
+        retain_metadata = self.storage_metadata_capacity > 0 and node.storage_backed
         self._record_remove_event(node, medium=StorageMedium.CPU)
         for comp in self._components_tuple:
             _, hf = self._evict_component_and_detach_lru(
-                node, comp, target=EvictLayer.ALL, tracker=None
+                node,
+                comp,
+                target=(EvictLayer.HOST if retain_metadata else EvictLayer.ALL),
+                tracker=None,
             )
             tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
+        if retain_metadata:
+            self._enter_storage_only(node)
+            self._update_evictable_leaf_sets(node)
+            self._update_evictable_leaf_sets(node.parent)
+            self._enforce_storage_metadata_capacity()
+            return
+
+        node.storage_backed = False
         self._remove_leaf_from_parent(node)
         self._iteratively_delete_tombstone_leaf(node, tracker)
 
@@ -1829,6 +2003,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             not self.enable_storage
             or self.cache_controller is None
             or not node.backuped
+            or node.storage_backed
+            or node.storage_backup_pending_id is not None
         ):
             return
 
@@ -1858,17 +2034,84 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
 
-        operation_id = self.cache_controller.write_storage(
-            node.component_data[BASE_COMPONENT_TYPE].host_value,
-            node.key.token_ids,
-            node.hash_value,
-            prefix_keys,
-            extra_pools=aux_xfers or None,
-        )
-        self.ongoing_backup[operation_id] = (
+        lock_params = self.inc_host_lock_ref(node).to_dec_params()
+        try:
+            operation_id = self.cache_controller.write_storage(
+                node.component_data[BASE_COMPONENT_TYPE].host_value,
+                node.key.token_ids,
+                node.hash_value,
+                prefix_keys,
+                extra_pools=aux_xfers or None,
+            )
+        except Exception:
+            self.dec_host_lock_ref(node, lock_params)
+            raise
+        node.storage_backup_pending_id = operation_id
+        self.ongoing_backup[operation_id] = _OngoingStorageBackup(
             node,
-            self.inc_host_lock_ref(node).to_dec_params(),
+            lock_params,
+            [node],
         )
+
+    def _replace_pending_storage_backup_node(
+        self,
+        old_node: UnifiedTreeNode,
+        new_nodes: list[UnifiedTreeNode],
+    ) -> None:
+        operation_id = old_node.storage_backup_pending_id
+        if operation_id is None:
+            return
+        pending = self.ongoing_backup.get(operation_id)
+        if pending is None:
+            return
+
+        publish_nodes: list[UnifiedTreeNode] = []
+        replaced = False
+        for node in pending.publish_nodes:
+            if node is old_node:
+                publish_nodes.extend(new_nodes)
+                replaced = True
+            else:
+                publish_nodes.append(node)
+        if not replaced:
+            return
+        for node in new_nodes:
+            node.storage_backup_pending_id = operation_id
+        self.ongoing_backup[operation_id] = pending._replace(
+            publish_nodes=publish_nodes
+        )
+
+    @staticmethod
+    def _storage_backup_succeeded(operation: Any) -> bool:
+        if operation.completed_tokens != len(operation.token_ids):
+            return False
+        extra_results = operation.pool_storage_result.extra_pool_hit_pages
+        for transfer in operation.pool_transfers or ():
+            if transfer.keys is None:
+                return False
+            expected_pages = len(transfer.keys)
+            actual_pages = extra_results.get(transfer.name)
+            if actual_pages is None:
+                actual_pages = extra_results.get(str(transfer.name), 0)
+            if actual_pages < expected_pages:
+                return False
+        return True
+
+    def _finish_storage_backup_ack(
+        self, operation: Any, *, succeeded: Optional[bool] = None
+    ) -> None:
+        pending = self.ongoing_backup.pop(operation.id, None)
+        if pending is None:
+            return
+        if succeeded is None:
+            succeeded = self._storage_backup_succeeded(operation)
+        for node in pending.publish_nodes:
+            if node.storage_backup_pending_id == operation.id:
+                node.storage_backup_pending_id = None
+            if succeeded:
+                node.storage_backed = True
+            self._update_evictable_leaf_sets(node)
+        self.dec_host_lock_ref(pending.lock_node, pending.lock_params)
 
     def prefetch_from_storage(
         self,
@@ -2058,9 +2301,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 pool_storage_result=operation.pool_storage_result,
             )
 
-        self.cache_controller.mem_pool_host.free(
-            host_indices[: insert_result.prefix_len]
-        )
+        if insert_result.reused_host_indices is not None:
+            self.cache_controller.mem_pool_host.free(insert_result.reused_host_indices)
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
@@ -2166,13 +2408,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return drained
 
         def _drain_backup():
-            drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                drained += 1
-                entry = self.ongoing_backup.pop(operation.id, None)
-                if entry is not None:
-                    node, lock_params = entry
-                    self.dec_host_lock_ref(node, lock_params)
+            operations = list(_drain_queue(cc.ack_backup_queue, n_backup))
+            if not operations:
+                return 0
+
+            # Publish storage-backed metadata only when every attention rank
+            # completed the same operation. min(id) and min(-id) encode both
+            # id extrema; the last column is the all-rank success bit. An
+            # identity/order mismatch therefore fails closed.
+            local_succeeded = [
+                operation.id in self.ongoing_backup
+                and self._storage_backup_succeeded(operation)
+                for operation in operations
+            ]
+            packed = torch.tensor(
+                [
+                    [operation.id, -operation.id, int(succeeded)]
+                    for operation, succeeded in zip(operations, local_succeeded)
+                ],
+                dtype=torch.int64,
+            )
+            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+
+            for operation, state in zip(operations, packed.tolist()):
+                min_id, neg_max_id, all_succeeded = map(int, state)
+                synchronized_success = (
+                    min_id == operation.id
+                    and -neg_max_id == operation.id
+                    and all_succeeded == 1
+                )
+                self._finish_storage_backup_ack(
+                    operation, succeeded=synchronized_success
+                )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -2181,7 +2448,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
-            return drained
+            return len(operations)
 
         def _drain_release():
             host_indices_list = []
@@ -2329,14 +2596,52 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def clear_storage_backend(self) -> bool:
+        if self.ongoing_backup:
+            logger.warning(
+                "Refusing to clear hierarchical cache storage while %d backups "
+                "are still in flight.",
+                len(self.ongoing_backup),
+            )
+            return False
         try:
             ok = self.cache_controller.clear_storage_backend()
         except Exception as e:
             logger.error("Failed to clear hierarchical cache storage backend: %s", e)
             return False
         if ok:
+            self._invalidate_storage_backing()
             logger.info("Hierarchical cache storage backend cleared successfully!")
         return ok
+
+    def _invalidate_storage_backing(self) -> None:
+        """Drop storage markers after L3 is cleared, preserving live L1/L2 data."""
+        stack: list[tuple[UnifiedTreeNode, bool]] = [(self.root_node, False)]
+        postorder: list[UnifiedTreeNode] = []
+        while stack:
+            node, visited = stack.pop()
+            if visited:
+                postorder.append(node)
+                continue
+            stack.append((node, True))
+            stack.extend((child, False) for child in node.children.values())
+
+        for node in postorder:
+            if node is self.root_node:
+                continue
+            self._leave_storage_only(node)
+            node.storage_backed = False
+            node.storage_backup_pending_id = None
+            full = node.component_data[BASE_COMPONENT_TYPE]
+            if full.value is None and full.host_value is None and not node.children:
+                self.evictable_device_leaves.discard(node)
+                self.evictable_host_leaves.discard(node)
+                self.evictable_storage_leaves.discard(node)
+                self._remove_leaf_from_parent(node)
+
+        self.storage_metadata_size_ = 0
+        self.evictable_storage_leaves.clear()
+        for node in self._collect_all_nodes():
+            self._update_evictable_leaf_sets(node)
 
     # ---- HiCache: Async Event Management ----
 
@@ -2670,6 +2975,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         if self.root_node.parent is not None:
             E("[Root] root has a parent pointer")
+        if self.root_node.storage_backed or self.root_node.storage_metadata_accounted:
+            E("[Root] root must not carry storage metadata state")
         # Parent ↔ child bidirectional consistency
         for node in all_nodes:
             for child in node.children.values():
@@ -2682,6 +2989,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # ── PART 2: Per-node state machine and leaf qualification ──
         expected_dev_leaves: set[UnifiedTreeNode] = set()
         expected_hst_leaves: set[UnifiedTreeNode] = set()
+        expected_storage_leaves: set[UnifiedTreeNode] = set()
 
         for node in all_nodes:
             if node is self.root_node:
@@ -2700,9 +3008,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if cd.host_value is not None and not full_hst:
                     E(f"node {nid} {ct} host present but Full.host_value=None")
 
-            # Every node must keep Full data on at least one layer.
+            # A reachable payload-free node is valid only when an acknowledged
+            # storage backup is explicitly retained and accounted.
             if not full_dev and not full_hst:
-                E(f"node {nid} dead: no Full device and no Full host")
+                if not node.storage_backed:
+                    E(f"node {nid} dead: no Full payload or storage backing")
+                if not node.storage_metadata_accounted:
+                    E(f"node {nid} storage-only but not metadata-accounted")
+            if node.storage_metadata_accounted and not node.storage_only:
+                E(f"node {nid} metadata-accounted but not storage-only")
+            if node.storage_backup_pending_id is not None and node.storage_only:
+                E(f"node {nid} is storage-only while backup is still pending")
 
             # Parent prefixes must keep data whenever the child does.
             if node.parent is not None and node.parent is not self.root_node:
@@ -2731,6 +3047,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 expected_dev_leaves.add(node)
             if self._is_host_leaf(node):
                 expected_hst_leaves.add(node)
+            if self._is_storage_leaf(node):
+                expected_storage_leaves.add(node)
 
         # ── PART 3: Tracking structures ──
 
@@ -2752,11 +3070,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if missing:
                 E(f"H-leaf missing: {[n.id for n in list(missing)[:5]]}")
 
+        if self.evictable_storage_leaves != expected_storage_leaves:
+            extra = self.evictable_storage_leaves - expected_storage_leaves
+            missing = expected_storage_leaves - self.evictable_storage_leaves
+            if extra:
+                E(f"S-leaf extra: {[n.id for n in list(extra)[:5]]}")
+            if missing:
+                E(f"S-leaf missing: {[n.id for n in list(missing)[:5]]}")
+
         # D-leaf ∩ H-leaf = ∅
         overlap = self.evictable_device_leaves & self.evictable_host_leaves
         if overlap:
             E(
                 f"[Leaf] {len(overlap)} in both sets: {[n.id for n in list(overlap)[:5]]}"
+            )
+        storage_overlap = self.evictable_storage_leaves & (
+            self.evictable_device_leaves | self.evictable_host_leaves
+        )
+        if storage_overlap:
+            E(
+                f"[Leaf] {len(storage_overlap)} storage leaves also resident: "
+                f"{[n.id for n in list(storage_overlap)[:5]]}"
             )
 
         # Stale nodes: leaf sets must only contain tree-reachable nodes
@@ -2769,6 +3103,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if stale:
             E(
                 f"{len(stale)} stale nodes in host_leaves: {[n.id for n in list(stale)[:5]]}"
+            )
+        stale = self.evictable_storage_leaves - all_node_set
+        if stale:
+            E(
+                f"{len(stale)} stale nodes in storage_leaves: "
+                f"{[n.id for n in list(stale)[:5]]}"
             )
 
         # Per-component LRU tracking
@@ -2841,6 +3181,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     f"[Size] {ct} protected={self.component_protected_size_[ct]} "
                     f"!= recomputed={protected}"
                 )
+        storage_metadata_size = sum(
+            len(n.key)
+            for n in all_nodes
+            if n is not self.root_node and n.storage_metadata_accounted
+        )
+        if self.storage_metadata_size_ != storage_metadata_size:
+            E(
+                f"[Size] storage metadata={self.storage_metadata_size_} "
+                f"!= recomputed={storage_metadata_size}"
+            )
+        if self.storage_metadata_size_ > self.storage_metadata_capacity:
+            E(
+                f"[Size] storage metadata={self.storage_metadata_size_} exceeds "
+                f"capacity={self.storage_metadata_capacity}"
+            )
 
         # ── PART 5: Ongoing Operations ──
         for nid, (n, _, _) in self.ongoing_write_through.items():
@@ -2857,6 +3212,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 E(
                     f"[Ongoing] load_back node {nid} lock_ref={n.component_data[FCT].lock_ref}"
                 )
+        for operation_id, pending in self.ongoing_backup.items():
+            if pending.lock_node not in all_node_set:
+                E(f"[Ongoing] storage backup {operation_id} lock node not in tree")
+            elif pending.lock_node.component_data[FCT].host_lock_ref <= 0:
+                E(
+                    f"[Ongoing] storage backup {operation_id} host lock="
+                    f"{pending.lock_node.component_data[FCT].host_lock_ref}"
+                )
+            for node in pending.publish_nodes:
+                if node not in all_node_set:
+                    E(
+                        f"[Ongoing] storage backup {operation_id} publish node "
+                        f"{node.id} not in tree"
+                    )
+                elif node.storage_backup_pending_id != operation_id:
+                    E(
+                        f"[Ongoing] storage backup {operation_id} publish node "
+                        f"{node.id} pending={node.storage_backup_pending_id}"
+                    )
 
         # ── Result ──
         if errors:
