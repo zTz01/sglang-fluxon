@@ -797,11 +797,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
+        lock_params = getattr(req, "tree_cache_lock_params", None)
+        if lock_params is None:
+            # Compatibility for requests acquired by an older caller.
+            lock_params = DecLockRefParams(
+                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)
+            )
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            lock_params,
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
+        req.tree_cache_lock_params = None
 
         # cleanup
         for comp in self._components_tuple:
@@ -887,10 +894,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-        )
+        lock_params = getattr(req, "tree_cache_lock_params", None)
+        if lock_params is None:
+            # Compatibility for requests acquired by an older caller.
+            lock_params = DecLockRefParams(
+                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)
+            )
+        self.dec_lock_ref(req.last_node, lock_params)
+        req.tree_cache_lock_params = None
         lock_result = self.inc_lock_ref(new_last_node)
 
         # Update req fields
@@ -903,6 +914,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.tree_cache_lock_params = lock_result.to_dec_params()
 
         # cleanup
         for comp in self._components_tuple:

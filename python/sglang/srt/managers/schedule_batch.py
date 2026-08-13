@@ -79,6 +79,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     EvictParams,
     MatchPrefixParams,
     zero_match_result,
@@ -864,6 +865,9 @@ class Req(ReqDllmMixin):
         self.storage_metadata_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
+        # Exact inverse of the current request tree lock. Device residency can
+        # change during load-back, so release must not recompute this range.
+        self.tree_cache_lock_params: Optional[DecLockRefParams] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
@@ -1504,6 +1508,7 @@ class Req(ReqDllmMixin):
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
+        self.tree_cache_lock_params = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
         self.dllm_initialized = False
