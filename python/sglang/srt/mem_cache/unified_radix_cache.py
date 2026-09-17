@@ -6475,17 +6475,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 return 0 if base_value is None else len(base_value)
 
-            if (
+            if not write_back and (
                 node.parent is not self.root_node
                 and not self._fluxon_hostless_node_storage_ready(node.parent)
             ):
-                if self.write_backup(node.parent, write_back=write_back) <= 0:
+                if self.write_backup(node.parent, write_back=False) <= 0:
                     return 0
                 if not self._fluxon_hostless_node_storage_ready(node.parent):
-                    if write_back:
-                        self._wait_for_fluxon_hostless_backup(node.parent)
-                    if not self._fluxon_hostless_node_storage_ready(node.parent):
-                        return 0
+                    return 0
 
             backend = self._fluxon_backend()
             if backend is None:
