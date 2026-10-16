@@ -3592,15 +3592,46 @@ class HiCacheFluxon(HiCacheStorage):
         if not keys:
             raise ValueError("Fluxon get_views requires at least one key")
         self._assert_fluxon_cuda_segments_registered("get_views")
-        storage_keys = [self._store_key(key, component_name) for key in keys]
         start = time.perf_counter()
-        plan_ptr = self.store.get_views(
-            storage_keys,
-            concurrency=self._batch_concurrency,
+        # Use the planned external-client path for synchronous restores.  The
+        # legacy store.get_views() wrapper probes each key through kv_get(),
+        # which can return a local holder without running the native planned
+        # SSD read/transfer path.  Planning the complete batch as one atomic
+        # group preserves the all-or-nothing semantics expected by callers and
+        # makes remote SSD pages go through get_plan -> execute_get_plan_cpu ->
+        # get_transfer.
+        plan_handle = self.get_plan(
+            keys,
+            component_name=component_name,
+            prefix_best_effort=False,
+            atomic_group_lens=[len(keys)],
         )
+        if int(plan_handle.result.transferable_len) != len(keys):
+            self.cancel_get_plan(plan_handle)
+            raise KeyError(
+                "Fluxon get_plan key not found: "
+                f"requested={len(keys)} raw_prefix_hit_len="
+                f"{plan_handle.result.raw_prefix_hit_len}"
+            )
+        try:
+            transfer_handle = self.execute_get_plan_cpu(
+                plan_handle,
+                consume_prefix_len=len(keys),
+            )
+        except Exception:
+            self.cancel_get_plan(plan_handle)
+            raise
+        try:
+            plan_ptr = self.get_transfer(
+                transfer_handle,
+                consume_prefix_len=len(keys),
+            )
+        except Exception:
+            self.cancel_get_transfer(transfer_handle)
+            raise
         logger.info(
             "Fluxon get_views success: pages=%d component=%s concurrency=%d duration_ms=%.3f",
-            len(storage_keys),
+            len(keys),
             component_name,
             self._batch_concurrency,
             (time.perf_counter() - start) * 1000.0,
