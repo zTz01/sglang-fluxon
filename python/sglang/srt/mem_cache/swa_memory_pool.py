@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
