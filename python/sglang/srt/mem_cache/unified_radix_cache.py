@@ -6792,7 +6792,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         if kv_tokens > 0:
                             sync_kv_plan_ptr = backend.get_views(kv_batch_hash_values)
                         if mamba_needs_restore:
-                            sync_mamba_plan_ptr = backend.get_views([mamba_state_key])
+                            sync_mamba_plan_ptr = backend.get_views(
+                                [mamba_state_key],
+                                component_name=PoolName.MAMBA,
+                            )
                     except Exception as exc:
                         if sync_kv_plan_ptr is not None:
                             backend.release_views(sync_kv_plan_ptr)
