@@ -9616,31 +9616,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # native Fluxon view path instead of converting the request
                     # into a false cache miss.
                     ready_operation = None
-                if ready_operation.kv_plan_offset_pages > 0:
-                    aligned_pages = len(
-                        self._node_hash_values_after_ancestor(
-                            ready_node,
-                            last_best_match_device_node,
+                if ready_operation is not None:
+                    if ready_operation.kv_plan_offset_pages > 0:
+                        aligned_pages = len(
+                            self._node_hash_values_after_ancestor(
+                                ready_node,
+                                last_best_match_device_node,
+                            )
                         )
-                    )
-                    logger.info(
-                        "Fluxon ready restore suffix aligned: req=%s "
-                        "plan_anchor_node=%d current_anchor_node=%d "
-                        "last_device_node=%d plan_offset_pages=%d "
-                        "aligned_pages=%d ready_pages=%d",
-                        req.rid,
-                        int(getattr(ready_operation, "anchor_node_id", -1)),
-                        int(getattr(best_match_node, "id", -1)),
-                        int(getattr(last_best_match_device_node, "id", -1)),
-                        int(ready_operation.kv_plan_offset_pages),
-                        aligned_pages,
-                        min(
-                            len(ready_operation.hash_value),
-                            ready_operation.completed_tokens // self.page_size,
-                        ),
-                    )
-                restore_match_node = ready_node
-                partial_ready_restore = restore_match_node is not best_match_node
+                        logger.info(
+                            "Fluxon ready restore suffix aligned: req=%s "
+                            "plan_anchor_node=%d current_anchor_node=%d "
+                            "last_device_node=%d plan_offset_pages=%d "
+                            "aligned_pages=%d ready_pages=%d",
+                            req.rid,
+                            int(getattr(ready_operation, "anchor_node_id", -1)),
+                            int(getattr(best_match_node, "id", -1)),
+                            int(getattr(last_best_match_device_node, "id", -1)),
+                            int(ready_operation.kv_plan_offset_pages),
+                            aligned_pages,
+                            min(
+                                len(ready_operation.hash_value),
+                                ready_operation.completed_tokens // self.page_size,
+                            ),
+                        )
+                    restore_match_node = ready_node
+                    partial_ready_restore = restore_match_node is not best_match_node
 
         def _collect_new_prefix_indices() -> torch.Tensor:
             prefix_chunks: list[torch.Tensor] = []
