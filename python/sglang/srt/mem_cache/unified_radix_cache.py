@@ -6715,12 +6715,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         req.rid,
                         None,
                     )
-                if ready_prefetch_operation is None:
-                    last_recoverable_error_kind = "not_ready"
-                    raise _FluxonHostlessCacheMiss(
-                        "Fluxon hostless load_back requires a ready restore entry: "
-                        f"best_match_node={best_match_node.id}"
-                    )
                 if req_id:
                     self._observe_fluxon_hostless_request(
                         req_id,
@@ -6747,47 +6741,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         last_read_key_sig,
                     ) = _fluxon_key_signature(kv_batch_hash_values)
                     last_read_node_id = best_match_node.id
-                    if self._fluxon_hostless_ready_operation_covers_kv(
-                        ready_prefetch_operation,
-                        kv_batch_hash_values,
-                        exact=False,
-                    ):
-                        kv_plan_offset_pages = int(
-                            ready_prefetch_operation.kv_plan_offset_pages
-                        )
-                        kv_plan_ptr = ready_prefetch_operation.kv_plan_ptr
-                        ready_prefetch_operation.kv_plan_ptr = None
-                        if kv_plan_ptr is None:
-                            raise RuntimeError(
-                                "Fluxon ready restore lost its ordered source plan"
-                            )
-                        if ready_prefetch_operation.gpu_direct:
-                            staging_lease = (
-                                ready_prefetch_operation.gpu_staging_lease
-                            )
-                            if staging_lease is None:
-                                raise RuntimeError(
-                                    "Fluxon ready GPU restore lost its staging lease"
-                                )
-                            remote_pages = sum(
-                                kv_plan_offset_pages
-                                <= index
-                                < kv_plan_offset_pages + len(kv_batch_hash_values)
-                                for index in ready_prefetch_operation.gpu_remote_indices
-                            )
-                            if kv_plan_offset_pages == 0:
-                                staging_lease.trim_after_transfer(remote_pages)
-                            kv_gpu_staging_lease = staging_lease
-                            ready_prefetch_operation.gpu_staging_lease = None
-                    else:
-                        last_recoverable_error_kind = "key_missing"
-                        raise _FluxonHostlessCacheMiss(
-                            "Fluxon hostless ready restore entry does not cover KV batch: "
-                            f"best_match_node={best_match_node.id} "
-                            f"expected={len(kv_batch_hash_values)} "
-                            f"ready_tokens={ready_prefetch_operation.completed_tokens} "
-                            f"anchor_node={ready_prefetch_operation.anchor_node_id}"
-                        )
 
                 if mamba_needs_restore:
                     mamba_state_key = self._node_mamba_storage_key(mamba_restore_node)
@@ -6796,15 +6749,129 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                             "Hostless Fluxon Mamba restore requires node hash: "
                             f"node={mamba_restore_node.id}"
                         )
-                    if (
-                        ready_prefetch_operation.mamba_anchor_node_id
+
+                # The asynchronous prefetch path is an optimization.  A request
+                # can reach load_back before its prefetch has been promoted to a
+                # ready entry (or after the entry only covers a shorter prefix).
+                # In that case use Fluxon's synchronous native view path, which
+                # also reads pages that reside on the native SSD backend.  The
+                # returned plan is wrapped in the same operation shape as the
+                # asynchronous path so the existing restore and cleanup logic
+                # remains shared.
+                kv_ready = (
+                    kv_tokens == 0
+                    or (
+                        ready_prefetch_operation is not None
+                        and self._fluxon_hostless_ready_operation_covers_kv(
+                            ready_prefetch_operation,
+                            kv_batch_hash_values,
+                            exact=False,
+                        )
+                    )
+                )
+                mamba_ready = (
+                    not mamba_needs_restore
+                    or (
+                        ready_prefetch_operation is not None
+                        and ready_prefetch_operation.mamba_anchor_node_id
                         == mamba_restore_node.id
                         and ready_prefetch_operation.mamba_key == mamba_state_key
                         and ready_prefetch_operation.mamba_plan_ptr is not None
+                    )
+                )
+                if not kv_ready or not mamba_ready:
+                    if ready_prefetch_operation is not None:
+                        self._cancel_fluxon_hostless_prefetch_operation(
+                            ready_prefetch_operation,
+                            "load_back_ready_entry_fallback",
+                        )
+                        ready_prefetch_operation = None
+                    sync_kv_plan_ptr: int | None = None
+                    sync_mamba_plan_ptr: int | None = None
+                    try:
+                        if kv_tokens > 0:
+                            sync_kv_plan_ptr = backend.get_views(kv_batch_hash_values)
+                        if mamba_needs_restore:
+                            sync_mamba_plan_ptr = backend.get_views([mamba_state_key])
+                    except Exception as exc:
+                        if sync_kv_plan_ptr is not None:
+                            backend.release_views(sync_kv_plan_ptr)
+                        if _is_fluxon_key_missing_error(exc):
+                            last_recoverable_error_kind = "key_missing"
+                            raise _FluxonHostlessCacheMiss(
+                                "Fluxon synchronous native SSD restore missed a key: "
+                                f"best_match_node={best_match_node.id} error={exc}"
+                            ) from exc
+                        raise
+                    ready_prefetch_operation = _FluxonHostlessPrefetchOperation(
+                        backend=backend,
+                        hash_value=list(kv_batch_hash_values),
+                        kv_handle=None,
+                        mamba_handle=None,
+                        mamba_key=mamba_state_key if mamba_needs_restore else None,
+                        completed_tokens=kv_tokens,
+                        total_tokens=kv_tokens,
+                        anchor_node_id=best_match_node.id,
+                        has_ready_transfer=True,
+                        kv_plan_ptr=sync_kv_plan_ptr,
+                        mamba_plan_ptr=sync_mamba_plan_ptr,
+                        mamba_anchor_node_id=(
+                            mamba_restore_node.id if mamba_needs_restore else best_match_node.id
+                        ),
+                    )
+                    logger.info(
+                        "Fluxon hostless synchronous native SSD restore fallback: "
+                        "req=%s node=%d kv_pages=%d mamba=%s",
+                        req_id,
+                        best_match_node.id,
+                        len(kv_batch_hash_values),
+                        mamba_needs_restore,
+                    )
+
+                if kv_tokens > 0:
+                    if not self._fluxon_hostless_ready_operation_covers_kv(
+                        ready_prefetch_operation,
+                        kv_batch_hash_values,
+                        exact=False,
                     ):
-                        mamba_plan_ptr = ready_prefetch_operation.mamba_plan_ptr
-                        ready_prefetch_operation.mamba_plan_ptr = None
-                    else:
+                        last_recoverable_error_kind = "key_missing"
+                        raise _FluxonHostlessCacheMiss(
+                            "Fluxon ready restore entry does not cover KV batch: "
+                            f"best_match_node={best_match_node.id} "
+                            f"expected={len(kv_batch_hash_values)}"
+                        )
+                    kv_plan_offset_pages = int(
+                        ready_prefetch_operation.kv_plan_offset_pages
+                    )
+                    kv_plan_ptr = ready_prefetch_operation.kv_plan_ptr
+                    ready_prefetch_operation.kv_plan_ptr = None
+                    if kv_plan_ptr is None:
+                        raise RuntimeError(
+                            "Fluxon ready restore lost its ordered source plan"
+                        )
+                    if ready_prefetch_operation.gpu_direct:
+                        staging_lease = ready_prefetch_operation.gpu_staging_lease
+                        if staging_lease is None:
+                            raise RuntimeError(
+                                "Fluxon ready GPU restore lost its staging lease"
+                            )
+                        remote_pages = sum(
+                            kv_plan_offset_pages
+                            <= index
+                            < kv_plan_offset_pages + len(kv_batch_hash_values)
+                            for index in ready_prefetch_operation.gpu_remote_indices
+                        )
+                        if kv_plan_offset_pages == 0:
+                            staging_lease.trim_after_transfer(remote_pages)
+                        kv_gpu_staging_lease = staging_lease
+                        ready_prefetch_operation.gpu_staging_lease = None
+
+                if mamba_needs_restore:
+                    if (
+                        ready_prefetch_operation.mamba_anchor_node_id != mamba_restore_node.id
+                        or ready_prefetch_operation.mamba_key != mamba_state_key
+                        or ready_prefetch_operation.mamba_plan_ptr is None
+                    ):
                         last_recoverable_error_kind = "key_missing"
                         last_read_node_id = mamba_restore_node.id
                         last_read_pages = 1
@@ -6812,9 +6879,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         last_read_last_key = mamba_state_key
                         last_read_key_sig = _fluxon_key_signature([mamba_state_key])[3]
                         raise _FluxonHostlessCacheMiss(
-                            "Fluxon hostless ready restore entry does not cover Mamba state for "
+                            "Fluxon ready restore entry does not cover Mamba state for "
                             f"node={mamba_restore_node.id}"
                         )
+                    mamba_plan_ptr = ready_prefetch_operation.mamba_plan_ptr
+                    ready_prefetch_operation.mamba_plan_ptr = None
 
                 if kv_tokens > 0:
                     if self.supports_swa():
@@ -9539,17 +9608,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         stale_operation,
                         "ready_no_whole_node_prefix",
                     )
-                    if req.rid in self._fluxon_hostless_request_observations:
-                        self._finish_fluxon_hostless_request_observation(
-                            req.rid,
-                            "ready_no_whole_node_prefix",
-                            anchor_node_id=best_match_node.id,
-                            host_hit_tokens=int(params.host_hit_length),
-                        )
-                    return (
-                        self._empty_match_result.device_indices,
-                        last_best_match_device_node,
-                    )
+                    # The ready plan is only an optimization.  If it does not
+                    # cover a whole radix node, let load_back use the synchronous
+                    # native Fluxon view path instead of converting the request
+                    # into a false cache miss.
+                    ready_operation = None
                 if ready_operation.kv_plan_offset_pages > 0:
                     aligned_pages = len(
                         self._node_hash_values_after_ancestor(
