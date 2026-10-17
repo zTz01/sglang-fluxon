@@ -815,9 +815,52 @@ class Scheduler(
         else:
             self.external_corpus_manager = None
 
+    def init_target_memory_pool(self):
+        """Allocate target KV cache pools if they have not been allocated yet."""
+        if (
+            self.tp_worker.model_runner.memory_pool_config is not None
+            and self.tp_worker.model_runner.req_to_token_pool is not None
+            and self.tp_worker.model_runner.token_to_kv_pool_allocator is not None
+        ):
+            return
+        self.tp_worker.alloc_memory_pool()
+
+    def init_memory_pools(self):
+        """Allocate KV cache pools for target and draft workers."""
+        self.init_target_memory_pool()
+        if self.draft_worker is not None:
+            pool, allocator = self.tp_worker.get_memory_pool()
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=self.tp_worker.model_runner.memory_pool_config,
+                req_to_token_pool=pool,
+                token_to_kv_pool_allocator=allocator,
+            )
+
+    def init_all_attention_backends(self):
+        """Initialize attention backends for all workers."""
+        self.tp_worker.init_attention_backends()
+        if self.draft_worker is not None:
+            self.draft_worker.init_attention_backends()
+
+    def init_all_cuda_graphs(self):
+        """Capture cuda graphs for all workers."""
+        self.tp_worker.init_cuda_graphs()
+        if self.draft_worker is not None:
+            self.draft_worker.init_cuda_graphs()
+
     def init_model_worker(self):
         self.init_tp_model_worker()
+        if self.spec_algorithm.is_frozen_kv_mtp():
+            # Frozen-KV MTP draft construction needs the target KV pool.
+            self.init_target_memory_pool()
         self.maybe_init_draft_worker()
+
+        # Allocate KV cache pools for all workers before querying worker info.
+        self.init_memory_pools()
+
+        # Attention backends and CUDA graphs depend on the allocated pools.
+        self.init_all_attention_backends()
+        self.init_all_cuda_graphs()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
