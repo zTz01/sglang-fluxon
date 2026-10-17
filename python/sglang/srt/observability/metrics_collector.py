@@ -21,7 +21,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -1726,6 +1726,38 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    # Fluxon reports L2 hit and backend I/O deltas through the storage
+    # metrics object.  Keep these fields optional for the older SGLang
+    # collectors used by Mooncake and LMCache.
+    l2_hit_pages: Dict[str, int] = field(default_factory=dict)
+    l2_hit_bytes: Dict[str, int] = field(default_factory=dict)
+    io_bytes: Dict[Tuple[str, str], int] = field(default_factory=dict)
+    io_bandwidth: Dict[Tuple[str, str], List[float]] = field(default_factory=dict)
+
+    def add_l2_hit_sample(
+        self,
+        locality: str,
+        pages: int = 0,
+        num_bytes: int = 0,
+    ) -> None:
+        if pages > 0:
+            self.l2_hit_pages[locality] = self.l2_hit_pages.get(locality, 0) + int(pages)
+        if num_bytes > 0:
+            self.l2_hit_bytes[locality] = self.l2_hit_bytes.get(locality, 0) + int(num_bytes)
+
+    def add_io_sample(
+        self,
+        op: str,
+        locality: str,
+        num_bytes: int,
+        bandwidth_gbps: Optional[float] = None,
+    ) -> None:
+        if num_bytes <= 0:
+            return
+        key = (op, locality)
+        self.io_bytes[key] = self.io_bytes.get(key, 0) + int(num_bytes)
+        if bandwidth_gbps is not None and bandwidth_gbps >= 0:
+            self.io_bandwidth.setdefault(key, []).append(float(bandwidth_gbps))
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
