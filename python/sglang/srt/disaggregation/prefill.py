@@ -82,7 +82,7 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
-def maybe_release_metadata_buffer(
+def release_req_to_metadata_buffer(
     req: Req, allocator: ReqToMetadataIdxAllocator
 ) -> None:
     """
@@ -94,9 +94,19 @@ def maybe_release_metadata_buffer(
         req: The request object that may have a metadata_buffer_index allocated
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
-    if req.metadata_buffer_index >= 0:
+    if (
+        hasattr(req, "metadata_buffer_index")
+        and req.metadata_buffer_index is not None
+        and req.metadata_buffer_index >= 0
+    ):
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+
+
+# Keep the older local name available for call sites that predate the
+# disaggregation cleanup.  The scheduler imports the deployed baseline name
+# above, while the prefill queue still uses this compatibility alias.
+maybe_release_metadata_buffer = release_req_to_metadata_buffer
 
 
 class PrefillBootstrapQueue:
