@@ -617,6 +617,7 @@ class Scheduler(
                 self.ps.attn_tp_rank == 0
                 or self.server_args.enable_metrics_for_all_schedulers
             ),
+            enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
         )
 
         self.load_snapshot_writer = None
