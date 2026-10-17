@@ -166,6 +166,22 @@ class InitLoadBackParams:
     req: Optional[Req] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class LogicalPageId:
+    """Stable page identity independent of host/device placement."""
+
+    page_key: str
+    index: int
+
+
+@dataclasses.dataclass(frozen=True)
+class RemotePageSpec:
+    """Page-level remote lookup result used by page-aware restore planning."""
+
+    page_id: LogicalPageId
+    contiguous_slot_count: int = 1
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -177,13 +193,15 @@ class MatchResult(NamedTuple):
                             this **must** be the same as `last_device_node`.
                             Reserved for L3 storage prefetch anchoring; L2 load_back
                             uses `best_match_node` instead.
-        best_match_node :   Deepest node accepted by all component validators
-                            during match_prefix. Anchor for every L2 host->device
-                            load_back walk (FULL / SWA / ...). For legacy caches
-                            that don't run multi-component validation, set this
-                            equal to `last_host_node`.
-        host_hit_length :   Number of Full-KV tokens that hit on host (CPU) and need to be
-                            loaded back to device. Pure-KV cache semantics;
+        best_match_node :   Deepest lower-tier recoverable match boundary used
+                            as the anchor for load_back. For hybrid Mamba caches,
+                            this may be the KV boundary while `mamba_state_node`
+                            tracks the Mamba state boundary separately.
+        host_hit_length :   Length of the host cache hit. For pure-KV caches this is the
+                            number of evicted KV tokens on CPU. For hybrid Mamba models this
+                            is max(kv_host_tokens, 1-if-mamba-on-host) so that a mamba-only
+                            host hit still triggers load-back without adding a separate field.
+                            0 if HiCache is not enabled.
         swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
                             window) and will be load-back into the SWA device pool.
         mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
@@ -191,6 +209,11 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        mamba_state_node: The deepest node with a usable Mamba state. This can be
+                          shallower than best_match_node when KV is lower-tier
+                          recoverable but Mamba state is not.
+        matched_page_ids: Logical page identities matched by the local radix tree.
+        remote_miss_pages: Page requests that require a remote restore.
         storage_metadata_hit_length: Number of prompt tokens whose exact radix path
                                 matched storage-only metadata. These tokens are not L2
                                 hits; L3 lookup is attempted independently from the last
@@ -202,10 +225,16 @@ class MatchResult(NamedTuple):
     last_host_node: Any
     best_match_node: Any
     host_hit_length: int = 0
-    swa_host_hit_length: int = 0
-    mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    matched_page_ids: Tuple[LogicalPageId, ...] = ()
+    remote_miss_pages: Tuple[RemotePageSpec, ...] = ()
+    mamba_state_node: Any = None
+    # Compatibility fields used by the older scheduler/component API. Keep
+    # them after the hostless fields so newer positional callers retain their
+    # established layout.
+    swa_host_hit_length: int = 0
+    mamba_host_hit_length: int = 0
     storage_metadata_hit_length: int = 0
 
 
@@ -222,6 +251,10 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         last_host_node=root,
         best_match_node=root,
         host_hit_length=0,
+        mamba_branching_seqlen=None,
+        matched_page_ids=(),
+        remote_miss_pages=(),
+        mamba_state_node=root,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
         storage_metadata_hit_length=0,

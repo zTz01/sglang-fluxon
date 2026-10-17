@@ -81,7 +81,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
     EvictParams,
+    LogicalPageId,
     MatchPrefixParams,
+    RemotePageSpec,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
@@ -796,6 +798,9 @@ class Req(ReqDllmMixin):
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Hostless Mamba tracks the state boundary separately from the KV
+        # boundary returned by prefix matching.
+        self.mamba_state_node: Any = None
         # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -863,6 +868,10 @@ class Req(ReqDllmMixin):
         # an observability/restoration hint, not an L2 hit and not a gate for
         # whether L3 is queried.
         self.storage_metadata_hit_length = 0
+        # Page-aware metadata used by the optional remote restore path. These
+        # fields are also part of the MatchResult compatibility contract.
+        self.matched_page_ids: Tuple[LogicalPageId, ...] = ()
+        self.remote_miss_pages: Tuple[RemotePageSpec, ...] = ()
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Exact inverse of the current request tree lock. Device residency can
@@ -1203,6 +1212,9 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.mamba_state_node = match_result.mamba_state_node
+            self.matched_page_ids = match_result.matched_page_ids
+            self.remote_miss_pages = match_result.remote_miss_pages
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1505,6 +1517,15 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
+        self.last_host_node = None
+        self.best_match_node = None
+        self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
+        self.storage_hit_length = 0
+        self.storage_metadata_hit_length = 0
+        self.matched_page_ids = ()
+        self.remote_miss_pages = ()
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
@@ -1523,6 +1544,7 @@ class Req(ReqDllmMixin):
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.mamba_state_node = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
