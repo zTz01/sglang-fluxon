@@ -402,6 +402,10 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    SGLANG_REMOTE_PAGE_CACHE_ENABLED = EnvBool(False)
+    SGLANG_REMOTE_PAGE_CACHE_BACKEND = EnvStr("fluxon")
+    SGLANG_REMOTE_PAGE_CACHE_FLUXON_CONFIG_PATH = EnvStr(None)
+    SGLANG_REMOTE_PAGE_CACHE_KEY_PREFIX = EnvStr("sglang_page")
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
