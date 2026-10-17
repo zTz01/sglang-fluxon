@@ -2209,8 +2209,13 @@ class Scheduler(
                 # is split on the next match. Hostless Fluxon conservatively
                 # clears storage_backed on such synthetic splits, turning a
                 # successful Plan into a recomputed prompt.
-                match_end = req._compute_max_prefix_len(len(req.fill_ids))
-                new_input_tokens = req.fill_ids[matched_len:match_end]
+                # Newer Req keeps the append-only prompt/output sequence in
+                # full_untruncated_fill_ids; older scheduler revisions called
+                # this field fill_ids.  The prefetch path runs before an
+                # extend range is assigned, so use the full sequence here.
+                fill_ids = req.full_untruncated_fill_ids
+                match_end = req._compute_max_prefix_len(len(fill_ids))
+                new_input_tokens = fill_ids[matched_len:match_end]
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
